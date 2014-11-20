@@ -1,0 +1,233 @@
+#!/usr/bin/env ruby
+require 'timeout'
+require 'thread'
+require 'socket'
+require "securerandom"
+require "ipaddr"
+require 'find'
+require 'yaml'
+require 'logger'
+
+Thread.abort_on_exception = true
+trap 'INT'  do exit end
+trap 'TERM' do exit end
+
+logger = Logger.new(STDOUT)
+logger.level = Logger::DEBUG
+
+class Mesos
+  attr_reader :mesos_master_ip, :mesos_master_port
+
+  def initialize(logger = Logger.new(STDOUT))
+    @logger = logger
+    @mesos_master, @mesos_slave = find_mesos
+    @mesos_master_ip = outgoing_ip
+    @mesos_master_port = 5050
+  end
+
+  def find_mesos
+    mesos_dirs = [*Dir.glob('/usr/local/Cellar/mesos/*/sbin/'), '/usr/local/sbin/', '/usr/local/bin/', '/usr/bin/', '/usr/sbin/', '/usr/', '/']
+    mesos_master, mesos_slave = nil
+
+    @logger.info "looking for mesos master and slave executables on the local system"
+    Find.find(*mesos_dirs.select {|p| FileTest.directory?(p)}) do |path|
+      if File.executable?(path) && path.end_with?('mesos-master')
+        @logger.info "found master executable #{path}"
+        mesos_master = path
+      elsif File.executable?(path) && path.end_with?('mesos-slave')
+        @logger.info "found slave executable #{path}"
+        mesos_slave = path
+      end
+
+      return mesos_master, mesos_slave if mesos_master && mesos_slave
+    end
+    raise "could not find mesos binaries"
+  end
+
+  def outgoing_ip
+    s = UDPSocket.new
+    s.connect('8.8.8.8', 53)
+    s.addr.last
+  end
+
+  def start_master
+    @logger.info "starting master on #{@mesos_master_ip}:#{@mesos_master_port}}"
+    Thread.new {
+      system("#{@mesos_master} --work_dir=/tmp --log_dir=/tmp --ip=#{@mesos_master_ip} --port=#{@mesos_master_port}")
+    }
+  end
+
+  def start_slave(master_info)
+    @logger.info "starting slave - connecting to master at #{master_info[:host]}:#{master_info[:port]}"
+    Thread.new {
+      system("#{@mesos_slave} --work_dir=/tmp --log_dir=/tmp --master=#{master_info[:host]}:#{master_info[:port]}")
+    }
+  end
+end
+
+class MesosMulticastMessage
+  attr_reader :client_id, :token, :content
+
+  def self.inflate(yaml)
+    attributes = YAML.load(yaml)
+    new(attributes)
+  end
+
+  def initialize(attributes={}, logger = Logger.new(STDOUT))
+    @client_id = attributes[:client_id]
+    @token = attributes[:token]
+    @content = attributes[:content]
+    @logger = logger
+  end
+
+  def to_yaml
+    { client_id: client_id, token: token, content: content }.to_yaml
+  end
+end
+
+class MesosMulticastClient
+  MULTICAST_ADDR = "224.178.226.115"
+  BIND_ADDR = "0.0.0.0"
+  PORT = 20097
+
+  attr_reader :token
+
+  def initialize(token, logger = Logger.new(STDOUT))
+    @token     = token
+    @client_id = SecureRandom.hex(5)
+    @listeners = []
+    @logger = logger
+  end
+
+  def add_message_listener(listener)
+    listen unless listening?
+    @listeners << listener
+  end
+
+  def transmit(content)
+    message = MesosMulticastMessage.new(
+      client_id: @client_id,
+      token:     @token,
+      content:   content
+    )
+    socket.send(message.to_yaml, 0, MULTICAST_ADDR, PORT)
+    message
+  end
+
+  private
+
+  def listen
+    socket.bind(BIND_ADDR, PORT)
+
+    Thread.new do
+      loop do
+        attributes, _ = socket.recvfrom(1024)
+        message = MesosMulticastMessage.inflate(attributes)
+        if message.client_id != @client_id && message.token == @token
+          @listeners.each { |listener| listener.new_message(message) }
+        end
+      end
+    end
+
+    @listening = true
+  end
+
+  def listening?
+    @listening == true
+  end
+
+  def socket
+    @socket ||= UDPSocket.open.tap do |socket|
+      socket.setsockopt(:IPPROTO_IP, :IP_ADD_MEMBERSHIP, bind_address)
+      socket.setsockopt(:IPPROTO_IP, :IP_MULTICAST_TTL, 1)
+      socket.setsockopt(:SOL_SOCKET, :SO_REUSEPORT, 1)
+    end
+  end
+
+  def bind_address
+    IPAddr.new(MULTICAST_ADDR).hton + IPAddr.new(BIND_ADDR).hton
+  end
+end
+
+class MesosZeroConf
+  def initialize(client, mesos, logger = Logger.new(STDOUT))
+    @client = client
+    @mesos = mesos
+    @found_server = Event.new
+    @server = nil
+    @port = nil
+    @logger = logger
+  end
+
+  def start
+    @client.add_message_listener(self)
+
+    @logger.info "looking for master with token #{@client.token}"
+    r = Random.new
+    timeout = r.rand(5.0) + 5
+    begin
+      Timeout::timeout(timeout) {
+        @found_server.wait
+      }
+    rescue Timeout::Error => e
+    end
+
+    if @host && @port
+      @logger.info "found master at #{@host}:#{@port}"
+      @mesos.start_slave(host: @host, port: @port).join
+    else
+      [
+        announce_master,
+        @mesos.start_master
+      ].each {|t| t.join}
+    end
+  end
+
+  def new_message(message)
+    case message.content[:type]
+    when :master_info
+      @host = message.content[:host]
+      @port = message.content[:port]
+      @found_server.set
+    end
+  end
+
+  private
+
+  def announce_master
+    Thread.new {
+      loop do
+        @client.transmit({type: :master_info, host: @mesos.mesos_master_ip, port: @mesos.mesos_master_port})
+        sleep 1
+      end
+    }
+  end
+
+end
+
+class Event
+  def initialize
+    @lock = Mutex.new
+    @cond = ConditionVariable.new
+    @flag = false
+  end
+
+  def set
+    @lock.synchronize do
+      @flag = true
+      @cond.broadcast
+   end
+  end
+
+  def wait
+    @lock.synchronize do
+      if not @flag
+        @cond.wait(@lock)
+      end
+    end
+  end
+end
+
+token = ARGV.length > 0 ? ARGV.shift : 'default'
+mzc = MesosZeroConf.new(MesosMulticastClient.new(token, logger), Mesos.new(logger), logger)
+mzc.start
