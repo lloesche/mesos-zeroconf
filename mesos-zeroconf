@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'timeout'
+require 'open3'
 require 'thread'
 require 'socket'
 require "securerandom"
@@ -8,25 +9,43 @@ require 'find'
 require 'yaml'
 require 'logger'
 
-Thread.abort_on_exception = true
-trap 'INT'  do exit end
-trap 'TERM' do exit end
-
 logger = Logger.new(STDOUT)
-logger.level = Logger::DEBUG
+logger.level = Logger::INFO
+
+Thread.abort_on_exception = true
+trap 'INT'  do shutdown end
+trap 'TERM' do shutdown end
+
 
 class Mesos
   attr_reader :mesos_master_ip, :mesos_master_port
 
-  def initialize(logger = Logger.new(STDOUT))
+  def initialize(args, logger = Logger.new(STDOUT))
+    @args = args
     @logger = logger
+    setup
+  end
+
+  def setup
     @mesos_master, @mesos_slave = find_mesos
-    @mesos_master_ip = outgoing_ip
-    @mesos_master_port = 5050
+
+    if master_ip = @args.select {|arg| arg.start_with?('--ip')}.first
+      @mesos_master_ip = master_ip.split('=', 2)[1]
+    else
+      @mesos_master_ip = outgoing_ip
+    end
+    if master_port = @args.select {|arg| arg.start_with?('--port')}.first
+      @mesos_master_port = master_port.split('=', 2)[1]
+    else
+      @mesos_master_port = 5050
+    end
+
+    @mesos_master_args = filter_args(@args, valid_args(@mesos_master), {'--log_dir' => '/tmp', '--work_dir' => '/tmp', '--ip' => @mesos_master_ip, '--port' => @mesos_master_port})
+    @mesos_slave_args = filter_args(@args, valid_args(@mesos_slave), {'--log_dir' => '/tmp', '--work_dir' => '/tmp'})    
   end
 
   def find_mesos
-    mesos_dirs = [*Dir.glob('/usr/local/Cellar/mesos/*/sbin/'), '/usr/local/sbin/', '/usr/local/bin/', '/usr/bin/', '/usr/sbin/', '/usr/', '/']
+    mesos_dirs = [*Dir.glob('/usr/local/Cellar/mesos/*/sbin/'), '/usr/local/sbin/', '/usr/local/bin/', '/usr/sbin/', '/usr/bin/', '/usr/', '/']
     mesos_master, mesos_slave = nil
 
     @logger.info "looking for mesos master and slave executables on the local system"
@@ -41,8 +60,47 @@ class Mesos
 
       return mesos_master, mesos_slave if mesos_master && mesos_slave
     end
+
     raise "could not find mesos binaries"
   end
+
+  def valid_args(cmd)
+    args = []
+    Open3.popen3(cmd, '--help') do |stdin, stdout, stderr, wait_thr|
+      stdin.close
+      lines = stderr.read.lines.map(&:chomp)
+      lines.each do |line|
+        if match = /^\s*--(?<arg>[^\s]+)/.match(line)
+          arg = match[:arg]
+          @logger.debug "#{cmd} supports #{arg}"
+          arg.slice!(/=VALUE$/)
+          if arg.slice!(/^\[no-\]/)
+            args << "no-#{arg}"
+          end
+          args << arg
+        end
+      end
+      stdout.close
+      stderr.close
+      wait_thr.join
+    end
+
+    args
+  end
+
+def filter_args(args, valid_args, default_args)
+  options = {}
+  args.each do |arg|
+    if arg.start_with?('--')
+      k, v = arg.split('=', 2)
+      options[k] = v if valid_args.include?(k[2..-1])
+    end
+  end
+  options = default_args.merge(options)
+  flags = options.select {|k, v| v.nil?}.keys + options.delete_if {|k, v| v.nil?}.collect { |k, v| "#{k}=#{v}" }
+
+  flags
+end
 
   def outgoing_ip
     s = UDPSocket.new
@@ -51,16 +109,38 @@ class Mesos
   end
 
   def start_master
-    @logger.info "starting master on #{@mesos_master_ip}:#{@mesos_master_port}}"
+    @logger.info "starting master: #{@mesos_master} #{@mesos_master_args.join(' ')}"
     Thread.new {
-      system("#{@mesos_master} --work_dir=/tmp --log_dir=/tmp --ip=#{@mesos_master_ip} --port=#{@mesos_master_port}")
+      Open3.popen2e(@mesos_master, *@mesos_master_args) do |stdin, stdout_stderr, wait_thr|
+        Thread.new {
+          stdout_stderr.each do |line|
+            puts line
+          end
+        }
+        stdin.close
+        at_exit do
+          Process.kill("TERM", wait_thr.pid)
+        end
+        wait_thr.join
+      end
     }
   end
 
   def start_slave(master_info)
-    @logger.info "starting slave - connecting to master at #{master_info[:host]}:#{master_info[:port]}"
+    @logger.info "starting slave: #{@mesos_slave} --master=#{master_info[:host]}:#{master_info[:port]} #{@mesos_slave_args.join(' ')}"
     Thread.new {
-      system("#{@mesos_slave} --work_dir=/tmp --log_dir=/tmp --master=#{master_info[:host]}:#{master_info[:port]}")
+      Open3.popen2e(@mesos_slave, "--master=#{master_info[:host]}:#{master_info[:port]}", *@mesos_slave_args) do |stdin, stdout_stderr, wait_thr|
+        Thread.new {
+          stdout_stderr.each do |line|
+            puts line
+          end
+        }
+        stdin.close
+        at_exit do
+          Process.kill("TERM", wait_thr.pid)
+        end
+        wait_thr.join
+      end
     }
   end
 end
@@ -149,6 +229,48 @@ class MesosMulticastClient
   end
 end
 
+class HttpRedirectServer
+  def initialize(master_info, logger, ip = '0.0.0.0', port = 5050)
+    @master_info, @ip, @port, @logger = master_info, ip, port, logger
+  end
+
+  def start()
+    Thread.new {
+      if @ip == @master_info[:host]
+        @logger.info "master seems to be running on the same host as slave - not starting redirect server"
+      else
+        @logger.info "listening for http requests on http://#{@ip}:#{@port}/ - redirecting to http://#{@master_info[:host]}:#{@master_info[:port]}/"
+        begin
+          server = TCPServer.new(@ip, @port)
+          loop do
+            begin
+              socket = server.accept
+              request = socket.gets
+              @logger.info "received HTTP request: #{request}"
+
+              response = "<html><head><meta http-equiv='Refresh' content='0; url=http://#{@master_info[:host]}:#{@master_info[:port]}/' /></head><body><p>Please follow <a href='http://#{@master_info[:host]}:#{@master_info[:port]}/'>this link</a>.</p></body></html>\n"
+              socket.print "HTTP/1.1 302 Found\r\n" +
+                "Location: http://#{@master_info[:host]}:#{@master_info[:port]}/\r\n" +
+                "Content-Type: text/html\r\n" +
+                "Content-Length: #{response.bytesize}\r\n" +
+                "Connection: close\r\n"
+              socket.print "\r\n"
+              socket.print response
+              socket.close
+            rescue => e
+              # we don't really care if the redirect server runs or not
+              # the master might run on the same host as the slave and
+              @logger.info "caught exception in redirect server: #{e}"
+            end
+          end
+        rescue Errno::EADDRINUSE => e
+          @logger.info "can't bind to tcp/#{@ip}:#{@port} - looks like a master is already running on this host"
+        end
+      end
+    }
+  end
+end
+
 class MesosZeroConf
   def initialize(client, mesos, logger = Logger.new(STDOUT))
     @client = client
@@ -174,7 +296,12 @@ class MesosZeroConf
 
     if @host && @port
       @logger.info "found master at #{@host}:#{@port}"
-      @mesos.start_slave(host: @host, port: @port).join
+      master_info = {host: @host, port: @port}
+      redirect_server = HttpRedirectServer.new(master_info, @logger, @mesos.mesos_master_ip, @mesos.mesos_master_port)
+      [
+        @mesos.start_slave(master_info),
+        redirect_server.start
+      ].each {|t| t.join}
     else
       [
         announce_master,
@@ -228,6 +355,18 @@ class Event
   end
 end
 
-token = ARGV.length > 0 ? ARGV.shift : 'default'
-mzc = MesosZeroConf.new(MesosMulticastClient.new(token, logger), Mesos.new(logger), logger)
+def shutdown
+  puts "shutting down"
+  exit
+end
+
+# quick and dirty option parsing to get a cluster token if
+# defined and pass the rest through to mesos-master/-slave
+token = 'default'
+args = Array.new(ARGV)
+if args.length > 0 && token_arg = args.select{|arg| arg[/^--token=/]}.first
+  args = args - [token_arg]
+  token = token_arg[8..-1]
+end
+mzc = MesosZeroConf.new(MesosMulticastClient.new(token, logger), Mesos.new(args, logger), logger)
 mzc.start
