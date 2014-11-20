@@ -23,7 +23,6 @@ class Mesos
   def initialize(args, logger = Logger.new(STDOUT))
     @args = args
     @logger = logger
-    setup
   end
 
   def setup
@@ -282,6 +281,7 @@ class MesosZeroConf
   end
 
   def start
+    @mesos.setup
     @client.add_message_listener(self)
 
     @logger.info "looking for master with token #{@client.token}"
