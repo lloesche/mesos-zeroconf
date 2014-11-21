@@ -205,7 +205,7 @@ class MesosMulticastClient
   def listen
     socket.bind(BIND_ADDR, PORT)
 
-    Thread.new do
+    Thread.new {
       loop do
         attributes, _ = socket.recvfrom(1024)
         message = MesosMulticastMessage.inflate(attributes)
@@ -213,7 +213,7 @@ class MesosMulticastClient
           @listeners.each { |listener| listener.new_message(message) }
         end
       end
-    end
+    }
 
     @listening = true
   end
