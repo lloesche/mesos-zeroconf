@@ -87,19 +87,19 @@ class Mesos
     args
   end
 
-def filter_args(args, valid_args, default_args)
-  options = {}
-  args.each do |arg|
-    if arg.start_with?('--')
-      k, v = arg.split('=', 2)
-      options[k] = v if valid_args.include?(k[2..-1])
+  def filter_args(args, valid_args, default_args)
+    options = {}
+    args.each do |arg|
+      if arg.start_with?('--')
+        k, v = arg.split('=', 2)
+        options[k] = v if valid_args.include?(k[2..-1])
+      end
     end
-  end
-  options = default_args.merge(options)
-  flags = options.select {|k, v| v.nil?}.keys + options.delete_if {|k, v| v.nil?}.collect { |k, v| "#{k}=#{v}" }
+    options = default_args.merge(options)
+    flags = options.select {|k, v| v.nil?}.keys + options.delete_if {|k, v| v.nil?}.collect { |k, v| "#{k}=#{v}" }
 
-  flags
-end
+    flags
+  end
 
   def outgoing_ip
     s = UDPSocket.new
