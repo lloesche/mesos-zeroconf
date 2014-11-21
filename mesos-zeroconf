@@ -23,21 +23,22 @@ class Mesos
   def initialize(args, logger = Logger.new(STDOUT))
     @args = args
     @logger = logger
-  end
-
-  def setup
-    @mesos_master, @mesos_slave = find_mesos
 
     if master_ip = @args.select {|arg| arg.start_with?('--ip')}.first
       @mesos_master_ip = master_ip.split('=', 2)[1]
-    else
-      @mesos_master_ip = outgoing_ip
     end
+
     if master_port = @args.select {|arg| arg.start_with?('--port')}.first
       @mesos_master_port = master_port.split('=', 2)[1]
     else
       @mesos_master_port = 5050
     end
+  end
+
+  def setup
+    @mesos_master, @mesos_slave = find_mesos
+
+    @mesos_master_ip = outgoing_ip if @mesos_master_ip.nil?
 
     @mesos_master_args = filter_args(@args, valid_args(@mesos_master), {'--log_dir' => '/tmp', '--work_dir' => '/tmp', '--ip' => @mesos_master_ip, '--port' => @mesos_master_port})
     @mesos_slave_args = filter_args(@args, valid_args(@mesos_slave), {'--log_dir' => '/tmp', '--work_dir' => '/tmp'})    
@@ -118,7 +119,10 @@ class Mesos
         }
         stdin.close
         at_exit do
-          Process.kill("TERM", wait_thr.pid)
+          begin
+            Process.kill("TERM", wait_thr.pid)
+          rescue Errno::ESRCH => e
+          end
         end
         wait_thr.join
       end
@@ -136,7 +140,10 @@ class Mesos
         }
         stdin.close
         at_exit do
-          Process.kill("TERM", wait_thr.pid)
+          begin
+            Process.kill("TERM", wait_thr.pid)
+          rescue Errno::ESRCH => e
+          end
         end
         wait_thr.join
       end
