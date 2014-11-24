@@ -310,9 +310,11 @@ class MesosZeroConf
         redirect_server.start
       ].each {|t| t.join}
     else
+      master_info = {host: @mesos.mesos_master_ip, port: @mesos.mesos_master_port}
       [
         announce_master,
-        @mesos.start_master
+        @mesos.start_master,
+        @mesos.start_slave(master_info)
       ].each {|t| t.join}
     end
   end
