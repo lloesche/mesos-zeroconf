@@ -41,7 +41,7 @@ class Mesos
     @mesos_master_ip = outgoing_ip if @mesos_master_ip.nil?
 
     @mesos_master_args = filter_args(@args, valid_args(@mesos_master), {'--log_dir' => '/tmp', '--work_dir' => '/tmp', '--ip' => @mesos_master_ip, '--port' => @mesos_master_port})
-    @mesos_slave_args = filter_args(@args, valid_args(@mesos_slave), {'--log_dir' => '/tmp', '--work_dir' => '/tmp'})    
+    @mesos_slave_args = filter_args(@args, valid_args(@mesos_slave), {'--log_dir' => '/tmp', '--work_dir' => '/tmp', '--ip' => @mesos_master_ip})
   end
 
   def find_mesos
