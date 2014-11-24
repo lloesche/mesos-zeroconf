@@ -45,7 +45,7 @@ class Mesos
   end
 
   def find_mesos
-    mesos_dirs = [*Dir.glob('/usr/local/Cellar/mesos/*/sbin/'), '/usr/local/sbin/', '/usr/local/bin/', '/usr/sbin/', '/usr/bin/', '/usr/', '/']
+    mesos_dirs = [*Dir.glob('/usr/local/Cellar/mesos/*/sbin'), '/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', File.expand_path('~'), '/usr', '/home', '/Users', '/']
     mesos_master, mesos_slave = nil
 
     @logger.info "looking for mesos master and slave executables on the local system"
@@ -291,7 +291,7 @@ class MesosZeroConf
     @mesos.setup
     @client.add_message_listener(self)
 
-    @logger.info "looking for master with token #{@client.token}"
+    @logger.info "looking for master of mesos cluster #{@client.token}"
     r = Random.new
     timeout = r.rand(5.0) + 5
     begin
@@ -371,9 +371,8 @@ end
 # defined and pass the rest through to mesos-master/-slave
 token = 'default'
 args = Array.new(ARGV)
-if args.length > 0 && token_arg = args.select{|arg| arg[/^--token=/]}.first
-  args = args - [token_arg]
-  token = token_arg[8..-1]
+if args.length > 0 && token_arg = args.select{|arg| arg[/^--cluster/]}.first
+  token = token_arg[10..-1]
 end
 mzc = MesosZeroConf.new(MesosMulticastClient.new(token, logger), Mesos.new(args, logger), logger)
 mzc.start
