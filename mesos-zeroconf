@@ -68,7 +68,14 @@ class Mesos
     args = []
     Open3.popen3(cmd, '--help') do |stdin, stdout, stderr, wait_thr|
       stdin.close
-      lines = stderr.read.lines.map(&:chomp)
+      begin
+        Timeout.timeout(1) do
+          # older mesos versions output --help on stderr
+          lines = stderr.read.lines.map(&:chomp)
+        end
+      rescue Timeout::Error
+        lines = stdout.read.lines.map(&:chomp)
+      end
       lines.each do |line|
         if match = /^\s*--(?<arg>[^\s]+)/.match(line)
           arg = match[:arg]
